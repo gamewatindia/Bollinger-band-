@@ -1,12 +1,251 @@
+"""Shark Exchange - Bollinger squeeze breakout backtest (single file).
+Run: python run_backtest.py --source gate --symbols BTCUSDT,ETHUSDT --days 90
+"""
 import argparse
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import numpy as np
 import pandas as pd
+import requests
 import yaml
-from sharkbt.data import ADAPTERS, get_candles, list_symbols
-from sharkbt.engine import simulate
-from sharkbt.report import write_report
-from sharkbt.strategy import add_bb, htf_flag, make_signals
+
+"""Candle data: gate | mexc | bybit | weex (USDT perpetual futures) ya csv. Binance use nahi hota."""
+
+TF_MS = {"1m": 60_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000,
+         "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000}
+COLS = ["open_time", "open", "high", "low", "close", "volume"]
+
+
+def _get(url, params=None):
+    for k in range(4):
+        try:
+            r = requests.get(url, params=params, timeout=30)
+            if r.status_code == 429:
+                time.sleep(2 + 2 * k); continue
+            r.raise_for_status()
+            return r.json()
+        except requests.RequestException:
+            if k == 3: raise
+            time.sleep(1 + k)
+    raise RuntimeError("rate limited: " + url)
+
+
+def _nat(sym, src):                       # internal "BTCUSDT" -> exchange ka symbol
+    b = sym[:-4]
+    return {"gate": f"{b}_USDT", "mexc": f"{b}_USDT", "bybit": sym, "weex": f"cmt_{sym.lower()}"}[src]
+
+
+# ---------- candle adapters: [[open_time_ms, o, h, l, c, v], ...] ----------
+def _gate(sym, tf, s, e):
+    d = _get("https://api.gateio.ws/api/v4/futures/usdt/candlesticks",
+             {"contract": _nat(sym, "gate"), "interval": tf, "from": s // 1000, "to": e // 1000})
+    return [[int(x["t"]) * 1000, x["o"], x["h"], x["l"], x["c"], x.get("v", 0)] for x in d]
+
+
+_MEXC = {"5m": "Min5", "15m": "Min15", "30m": "Min30", "1h": "Min60", "4h": "Hour4", "1d": "Day1"}
+def _mexc(sym, tf, s, e):
+    d = _get("https://contract.mexc.com/api/v1/contract/kline/" + _nat(sym, "mexc"),
+             {"interval": _MEXC[tf], "start": s // 1000, "end": e // 1000})["data"]
+    return [[int(t) * 1000, o, h, l, c, v] for t, o, h, l, c, v in
+            zip(d["time"], d["open"], d["high"], d["low"], d["close"], d["vol"])]
+
+
+_BYBIT = {"5m": "5", "15m": "15", "30m": "30", "1h": "60", "4h": "240", "1d": "D"}
+def _bybit(sym, tf, s, e):
+    d = _get("https://api.bybit.com/v5/market/kline",
+             {"category": "linear", "symbol": sym, "interval": _BYBIT[tf],
+              "start": s, "end": e, "limit": 1000})["result"]["list"]
+    return [[int(x[0])] + x[1:6] for x in d]
+
+
+def _weex(sym, tf, s, e):                 # UNVERIFIED: response format check karna
+    d = _get("https://api-contract.weex.com/capi/v2/market/candles",
+             {"symbol": _nat(sym, "weex"), "granularity": tf, "startTime": s, "endTime": e, "limit": 1000})
+    return [[int(x[0])] + list(x[1:6]) for x in d]
+
+
+ADAPTERS = {"gate": (_gate, 1900), "mexc": (_mexc, 1900), "bybit": (_bybit, 950), "weex": (_weex, 900)}
+
+
+def list_symbols(src):
+    """USDT perpetual pairs of that exchange, internal format BTCUSDT."""
+    if src == "gate":
+        d = _get("https://api.gateio.ws/api/v4/futures/usdt/contracts")
+        out = [x["name"].replace("_", "") for x in d if not x.get("in_delisting")]
+    elif src == "mexc":
+        d = _get("https://contract.mexc.com/api/v1/contract/detail")["data"]
+        out = [x["symbol"].replace("_", "") for x in d if x.get("quoteCoin") == "USDT" and x.get("state") == 0]
+    elif src == "bybit":
+        out, cur = [], ""
+        while True:
+            r = _get("https://api.bybit.com/v5/market/instruments-info",
+                     {"category": "linear", "limit": 1000, "cursor": cur})["result"]
+            out += [x["symbol"] for x in r["list"] if x["quoteCoin"] == "USDT"
+                    and x["status"] == "Trading" and x.get("contractType") == "LinearPerpetual"]
+            cur = r.get("nextPageCursor")
+            if not cur: break
+    elif src == "weex":                   # UNVERIFIED
+        d = _get("https://api-contract.weex.com/capi/v2/market/contracts")
+        out = [x["symbol"].replace("cmt_", "").upper() for x in d if str(x["symbol"]).endswith("usdt")]
+    else:
+        raise ValueError("list_symbols: source " + src)
+    return sorted(s for s in out if s.endswith("USDT"))
+
+
+def _fetch(src, sym, tf, s, e):
+    fn, maxn = ADAPTERS[src]
+    step, rows, cur = maxn * TF_MS[tf], [], s
+    while cur < e:
+        rows += fn(sym, tf, cur, min(cur + step - 1, e))
+        cur += step
+        time.sleep(0.12)
+    df = pd.DataFrame(rows, columns=COLS)
+    for c in COLS:
+        df[c] = pd.to_numeric(df[c])
+    return df
+
+
+def get_candles(symbol, tf, cfg, refresh=False):
+    """Sirf closed candles. cols: open_time(ms), open, high, low, close, volume."""
+    src = cfg["source"]
+    d = Path(cfg["csv_dir"]) if src == "csv" else Path(cfg["csv_dir"]) / src
+    path = d / f"{symbol}_{tf}.csv"
+    if src == "csv" or (path.exists() and not refresh):
+        df = pd.read_csv(path)
+    else:
+        end = int(time.time() * 1000)
+        df = _fetch(src, symbol, tf, end - int(cfg["days"] * 86_400_000), end)
+        d.mkdir(parents=True, exist_ok=True)
+        df.to_csv(path, index=False)
+    df = df[df.open_time + TF_MS[tf] <= int(time.time() * 1000)]
+    return df.drop_duplicates("open_time").sort_values("open_time").reset_index(drop=True)
+
+
+
+
+def add_bb(df, period, std, lookback, quantile, min_bars):
+    df = df.copy()
+    m = df.close.rolling(period).mean()
+    sd = df.close.rolling(period).std(ddof=0)
+    df["mid"], df["up"], df["lo"] = m, m + std * sd, m - std * sd
+    df["bw"] = (df.up - df.lo) / df.mid
+    thr = df.bw.rolling(lookback).quantile(quantile)
+    df["is_sq"] = df.bw <= thr
+    df["squeeze_ok"] = df.is_sq.rolling(min_bars).sum() == min_bars
+    return df
+
+
+def htf_flag(base, htf, htf_tf):
+    """Base candle ke open par, last *closed* HTF candle me squeeze tha ya nahi (no lookahead)."""
+    h = pd.DataFrame({"avail": htf.open_time + TF_MS[htf_tf], "f": htf.squeeze_ok.astype(bool)})
+    b = pd.DataFrame({"t": base.open_time})
+    m = pd.merge_asof(b, h, left_on="t", right_on="avail", direction="backward")
+    return m.f.fillna(False).astype(bool).to_numpy()
+
+
+def make_signals(base, flags):
+    """+1 long, -1 short, 0 none. Squeeze pichli candle tak thi, ab band tod di."""
+    sq = base.squeeze_ok.shift(1, fill_value=False).astype(bool).to_numpy().copy()
+    for f in flags:
+        sq &= f
+    long = sq & (base.close > base.up).to_numpy()
+    short = sq & (base.close < base.lo).to_numpy()
+    return np.where(long, 1, np.where(short, -1, 0))
+
+
+
+
+def simulate(df, sig, t):
+    """Entry: signal candle ke agli candle ke open par. Initial SL = signal candle ki BB middle line.
+    Partial TPs (t['tp_levels']): level hit hone par us qty ka profit book, SL = us TP price par.
+    Conservative: ek candle me SL aur TP dono lage to SL pehle; SL shift agli candle se lagu."""
+    o, h, l, c = (df[k].to_numpy() for k in ("open", "high", "low", "close"))
+    mid, ot = df.mid.to_numpy(), df.open_time.to_numpy()
+    n, free, out = len(df), 0, []
+    notional = t["margin_inr"] * t["leverage"]
+    cost = 2 * (t["taker_fee_pct"] + t["slippage_pct"]) / 100
+    lv = [(x["pct"] / 100, x["qty_pct"] / 100) for x in t["tp_levels"]]
+    for i in np.flatnonzero(sig):
+        if i + 1 >= n or i + 1 < free:
+            continue
+        side, e, sl0 = int(sig[i]), o[i + 1], mid[i]
+        if (side == 1 and sl0 >= e) or (side == -1 and sl0 <= e) or abs(e - sl0) / e > t["max_sl_pct"] / 100:
+            continue
+        tps = [e * (1 + side * p) for p, _ in lv]
+        sl, k, rem, gross, reason, jx = sl0, 0, 1.0, 0.0, "EOD", n - 1
+        done = False
+        for j in range(i + 1, n):
+            if (l[j] <= sl) if side == 1 else (h[j] >= sl):          # SL pehle
+                gross += rem * side * (sl - e) / e
+                reason, jx, done = ("SL" if k == 0 else f"SL@TP{k}"), j, True
+                break
+            new_sl = None
+            while k < len(lv) and ((h[j] >= tps[k]) if side == 1 else (l[j] <= tps[k])):
+                q = rem if k == len(lv) - 1 else min(lv[k][1], rem)
+                gross += q * side * (tps[k] - e) / e
+                rem -= q; new_sl = tps[k]; k += 1
+            if new_sl is not None:
+                sl = new_sl
+            if k == len(lv):
+                reason, jx, done = f"TP{k}", j, True
+                break
+        if not done:
+            gross += rem * side * (c[-1] - e) / e
+        pnl = max(notional * (gross - cost), -t["margin_inr"])
+        out.append(dict(side="LONG" if side == 1 else "SHORT", entry_time=int(ot[i + 1]),
+                        exit_time=int(ot[jx]), entry=e, sl_initial=sl0, tp_hits=k,
+                        reason=reason, pnl_inr=pnl))
+        free = jx + 1
+    return out
+
+
+
+
+def _stats(g):
+    g = g.sort_values("exit_time")
+    pnl = g.pnl_inr
+    eq = pnl.cumsum()
+    gp, gl = pnl[pnl > 0].sum(), -pnl[pnl < 0].sum()
+    return pd.Series(dict(trades=len(g), win_rate_pct=round((pnl > 0).mean() * 100, 2),
+                          tp1_hit_pct=round((g.tp_hits >= 1).mean() * 100, 1),
+                          tp2_hit_pct=round((g.tp_hits >= 2).mean() * 100, 1),
+                          tp3_hit_pct=round((g.tp_hits >= 3).mean() * 100, 1),
+                          net_pnl_inr=round(pnl.sum(), 2), avg_trade_inr=round(pnl.mean(), 2),
+                          profit_factor=round(gp / gl, 3) if gl > 0 else np.inf,
+                          max_drawdown_inr=round((eq.cummax() - eq).max(), 2)))
+
+
+def write_report(trades, outdir):
+    out = Path(outdir)
+    out.mkdir(parents=True, exist_ok=True)
+    if trades.empty:
+        print("Koi trade nahi bana. Squeeze params ya symbols/days badlo.")
+        return
+    trades["entry_dt"] = pd.to_datetime(trades.entry_time, unit="ms")
+    trades["exit_dt"] = pd.to_datetime(trades.exit_time, unit="ms")
+    trades.to_csv(out / "trades.csv", index=False)
+    summary = trades.groupby("tf").apply(_stats, include_groups=False).reset_index()
+    summary.to_csv(out / "summary.csv", index=False)
+    trades.groupby(["symbol", "tf"]).apply(_stats, include_groups=False).reset_index() \
+        .to_csv(out / "per_symbol.csv", index=False)
+    trades.groupby(["tf", "reason"]).pnl_inr.agg(["count", "sum"]).round(2).reset_index() \
+        .to_csv(out / "exit_reasons.csv", index=False)
+    print(summary.to_string(index=False))
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(figsize=(10, 5))
+        for tf, g in trades.groupby("tf"):
+            g = g.sort_values("exit_time")
+            ax.plot(g.exit_dt, g.pnl_inr.cumsum(), label=tf)
+        ax.set_ylabel("Cumulative PnL (INR)"); ax.legend(); ax.grid(alpha=.3)
+        fig.tight_layout(); fig.savefig(out / "equity.png", dpi=120)
+    except Exception as ex:
+        print("Plot skip:", ex)
+
+
 
 
 def run_symbol(sym, cfg, refresh):
@@ -62,3 +301,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
