@@ -2,6 +2,7 @@
 Run: python run_backtest.py --source gate --symbols BTCUSDT,ETHUSDT --days 90
 """
 import argparse
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -17,8 +18,24 @@ TF_MS = {"1m": 60_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000,
 COLS = ["open_time", "open", "high", "low", "close", "volume"]
 
 
+_LOCK, _NEXT = threading.Lock(), {}
+_GAP = {"mexc": 0.25, "gateio": 0.1, "bybit": 0.06, "weex": 0.2}      # exchange par min gap (sec), sab threads ke liye
+
+
+def _throttle(url):
+    for key, gap in _GAP.items():
+        if key in url:
+            with _LOCK:
+                now = time.time()
+                t = max(now, _NEXT.get(key, 0))
+                _NEXT[key] = t + gap
+            time.sleep(max(0, t - now))
+            return
+
+
 def _get(url, params=None):
     for k in range(4):
+        _throttle(url)
         try:
             r = requests.get(url, params=params, timeout=30)
             if r.status_code == 429:
@@ -45,10 +62,20 @@ def _gate(sym, tf, s, e):
 
 _MEXC = {"5m": "Min5", "15m": "Min15", "30m": "Min30", "1h": "Min60", "4h": "Hour4", "1d": "Day1"}
 def _mexc(sym, tf, s, e):
-    d = _get("https://contract.mexc.com/api/v1/contract/kline/" + _nat(sym, "mexc"),
-             {"interval": _MEXC[tf], "start": s // 1000, "end": e // 1000})["data"]
-    return [[int(t) * 1000, o, h, l, c, v] for t, o, h, l, c, v in
-            zip(d["time"], d["open"], d["high"], d["low"], d["close"], d["vol"])]
+    url = "https://contract.mexc.com/api/v1/contract/kline/" + _nat(sym, "mexc")
+    for k in range(6):
+        j = _get(url, {"interval": _MEXC[tf], "start": s // 1000, "end": e // 1000})
+        d = j.get("data") if isinstance(j, dict) else None
+        if isinstance(d, dict) and "time" in d:
+            return [[int(t) * 1000, o, h, l, c, v] for t, o, h, l, c, v in
+                    zip(d["time"], d["open"], d["high"], d["low"], d["close"], d["vol"])]
+        msg = str(j)[:200]
+        if isinstance(j, dict) and j.get("success") and not d:
+            return []                                        # is range me candles nahi
+        if "frequent" in msg.lower() or "510" in msg or "429" in msg:
+            time.sleep(2 * (k + 1)); continue                # rate limit: ruk ke retry
+        raise RuntimeError("MEXC " + msg)
+    raise RuntimeError("MEXC rate limit: " + msg)
 
 
 _BYBIT = {"5m": "5", "15m": "15", "30m": "30", "1h": "60", "4h": "240", "1d": "D"}
@@ -99,7 +126,6 @@ def _fetch(src, sym, tf, s, e):
     while cur < e:
         rows += fn(sym, tf, cur, min(cur + step - 1, e))
         cur += step
-        time.sleep(0.12)
     df = pd.DataFrame(rows, columns=COLS)
     for c in COLS:
         df[c] = pd.to_numeric(df[c])
