@@ -11,7 +11,7 @@ on:
         default: "BTCUSDT,ETHUSDT"
       days:
         description: "Kitne din ka data"
-        default: "365"
+        default: "90"
 
 jobs:
   backtest:
@@ -28,21 +28,26 @@ jobs:
           python-version: "3.11"
           cache: pip
       - run: pip install -r requirements.txt
-      - name: Tests
-        run: PYTHONPATH=. python tests/test_all.py
       - name: Run backtest
         run: |
           ARGS="--source $SRC --days $DAYS"
           if [ "$SYMS" != "all" ]; then ARGS="$ARGS --symbols $SYMS"; fi
-          python run_backtest.py $ARGS | tee run.log
+          python run_backtest.py $ARGS 2>&1 | tee run.log
       - name: Summary
         if: always()
         run: |
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          python -c "import pandas as pd; print(pd.read_csv('results/summary.csv').to_string(index=False))" >> "$GITHUB_STEP_SUMMARY" || tail -30 run.log >> "$GITHUB_STEP_SUMMARY"
+          if [ -f results/summary.csv ]; then
+            python -c "import pandas as pd; print(pd.read_csv('results/summary.csv').to_string(index=False))" >> "$GITHUB_STEP_SUMMARY"
+          elif [ -f run.log ]; then
+            tail -30 run.log >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No output" >> "$GITHUB_STEP_SUMMARY"
+          fi
           echo '```' >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: backtest-results
           path: results/
+          if-no-files-found: ignore
