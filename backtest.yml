@@ -1,0 +1,48 @@
+name: Backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "Data source: gate | mexc | bybit | weex"
+        default: "gate"
+      symbols:
+        description: "Comma separated (BTCUSDT,ETHUSDT) ya all"
+        default: "BTCUSDT,ETHUSDT"
+      days:
+        description: "Kitne din ka data"
+        default: "365"
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      SRC: ${{ inputs.source }}
+      SYMS: ${{ inputs.symbols }}
+      DAYS: ${{ inputs.days }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Tests
+        run: PYTHONPATH=. python tests/test_all.py
+      - name: Run backtest
+        run: |
+          ARGS="--source $SRC --days $DAYS"
+          if [ "$SYMS" != "all" ]; then ARGS="$ARGS --symbols $SYMS"; fi
+          python run_backtest.py $ARGS | tee run.log
+      - name: Summary
+        if: always()
+        run: |
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          python -c "import pandas as pd; print(pd.read_csv('results/summary.csv').to_string(index=False))" >> "$GITHUB_STEP_SUMMARY" || tail -30 run.log >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: backtest-results
+          path: results/
